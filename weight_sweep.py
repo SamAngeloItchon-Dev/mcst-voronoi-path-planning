@@ -1,0 +1,347 @@
+"""
+weight_sweep.py
+Headless batch runner for comparing cost-function weight combinations.
+
+The simulation logic (Voronoi graph, cost terms, projectile spawning, robot
+movement, collision check) is copied from the original test (2).py without
+changes. Only three things are different:
+  1. weights are passed in instead of being global constants
+  2. no plotting, so thousands of trials can run unattended
+  3. every trial is seeded, so ALL weight combinations face the exact same
+     map, start, goal and projectile spawns (paired comparison)
+
+Usage examples
+  # Stage 1 - screen all combinations (tuning seeds 1-50)
+  python weight_sweep.py --trials 50 --seed-start 1 --out tuning_results.csv
+
+  # Stage 2 - confirm on fresh seeds the tuning stage never saw
+  python weight_sweep.py --trials 100 --seed-start 1001 \
+      --combos baseline,goal_only,safety_heavy --out validation_results.csv
+"""
+import argparse
+import csv
+import time
+from collections import defaultdict
+from multiprocessing import Pool
+
+import numpy as np
+from scipy.spatial import Voronoi
+
+# ----------------------------------------------------------------------------
+# CONFIG (same values as the original script)
+# ----------------------------------------------------------------------------
+NUM_POINTS = 40
+MAP_SIZE = 100
+ROBOT_SPEED = 1.0
+COLLISION_THRESHOLD = 2.0
+PREDICTION_FACTOR = 0.0
+ANGLE_OFFSET_DEG = 2
+MAX_STEPS = 2000
+
+PROJECTILE_COUNTS = [10, 20, 30]
+PROJECTILE_SPEEDS = [1, 2, 3]
+
+# ----------------------------------------------------------------------------
+# WEIGHT COMBINATIONS TO TEST  (goal, risk, ttc, smooth, backtrack)
+# Edit freely. "baseline" is what the original 90 trials used.
+# ----------------------------------------------------------------------------
+COMBOS = {
+    "baseline":       (1.0, 20, 20, 0.5, 1.0),
+    "goal_only":      (1.0, 0,  0,  0.5, 1.0),   # no threat terms: conventional Voronoi proxy
+    "risk_only":      (1.0, 20, 0,  0.5, 1.0),
+    "ttc_only":       (1.0, 0,  20, 0.5, 1.0),
+    "light_safety":   (1.0, 5,  5,  0.5, 1.0),
+    "safety_heavy":   (1.0, 50, 50, 0.5, 1.0),
+    "goal_heavy":     (3.0, 20, 20, 0.5, 1.0),
+    "smooth_heavy":   (1.0, 20, 20, 5.0, 1.0),
+    "backtrack_heavy": (1.0, 20, 20, 0.5, 5.0),
+}
+
+
+# ----------------------------------------------------------------------------
+# Original functions (unchanged logic)
+# ----------------------------------------------------------------------------
+def build_graph(vor):
+    graph = {}
+    for ridge in vor.ridge_vertices:
+        if -1 not in ridge:
+            v1, v2 = ridge
+            if all(0 <= vor.vertices[v][0] <= MAP_SIZE and 0 <= vor.vertices[v][1] <= MAP_SIZE for v in (v1, v2)):
+                graph.setdefault(v1, []).append(v2)
+                graph.setdefault(v2, []).append(v1)
+    return graph
+
+
+def closest_vertex(point, vertices):
+    valid_indices = [i for i, v in enumerate(vertices) if 0 <= v[0] <= MAP_SIZE and 0 <= v[1] <= MAP_SIZE]
+    dists = [np.linalg.norm(vertices[i] - point) for i in valid_indices]
+    return valid_indices[np.argmin(dists)]
+
+
+def distance_point_to_segment(p, a, b):
+    ap = p - a
+    ab = b - a
+    t = np.dot(ap, ab) / np.dot(ab, ab)
+    t = max(0, min(1, t))
+    closest_point = a + t * ab
+    return np.linalg.norm(p - closest_point)
+
+
+def project_point_to_segment(p, a, b):
+    ap = p - a
+    ab = b - a
+    t = np.dot(ap, ab) / np.dot(ab, ab)
+    t = max(0, min(1, t))
+    return a + t * ab
+
+
+def rotate_vector(vec, angle_deg):
+    angle_rad = np.radians(angle_deg)
+    rot_matrix = np.array([[np.cos(angle_rad), -np.sin(angle_rad)],
+                           [np.sin(angle_rad), np.cos(angle_rad)]])
+    return np.dot(rot_matrix, vec)
+
+
+def safe_greedy_path(graph, vertices, start_v, goal_v, projectiles, weights, projectile_speed):
+    w_goal, w_risk, w_ttc, w_smooth, w_backtrack = weights
+    path = [start_v]
+    visited = set([start_v])
+    current = start_v
+    current_goal_dist = np.linalg.norm(vertices[current] - vertices[goal_v])
+
+    while current != goal_v:
+        neighbors = [v for v in graph.get(current, []) if v not in visited]
+        if not neighbors:
+            break
+
+        scored_neighbors = []
+        for v in neighbors:
+            point = vertices[v]
+
+            # S - path smoothness
+            goal_vector = vertices[goal_v] - vertices[current]
+            next_vector = point - vertices[current]
+            S = 0
+            if np.linalg.norm(goal_vector) > 0 and np.linalg.norm(next_vector) > 0:
+                goal_vector = goal_vector / np.linalg.norm(goal_vector)
+                next_vector = next_vector / np.linalg.norm(next_vector)
+                cos_theta = np.clip(np.dot(goal_vector, next_vector), -1, 1)
+                S = np.arccos(cos_theta)
+
+            # D - distance to goal
+            D = np.linalg.norm(point - vertices[goal_v])
+
+            # R - projectile risk
+            R = 0
+            for proj in projectiles:
+                dist_to_edge = distance_point_to_segment(proj, vertices[current], point)
+                R += 1 / (dist_to_edge + 1)
+
+            # T - time-to-collision
+            T = 0
+            for proj in projectiles:
+                closest = project_point_to_segment(proj, vertices[current], point)
+                dist = np.linalg.norm(proj - closest)
+                ttc = dist / (projectile_speed + 1e-6)
+                T += 1 / (ttc + 1)
+
+            # B - backtracking
+            B = max(0, D - current_goal_dist)
+
+            total_cost = (w_goal * D + w_risk * R + w_ttc * T +
+                          w_smooth * S + w_backtrack * B)
+            scored_neighbors.append((v, total_cost))
+
+        next_v = min(scored_neighbors, key=lambda x: x[1])[0]
+        path.append(next_v)
+        visited.add(next_v)
+        current_goal_dist = np.linalg.norm(vertices[next_v] - vertices[goal_v])
+        current = next_v
+    return path
+
+
+def spawn_guaranteed_projectiles(robot_pos, goal, num_projectiles):
+    projectiles = []
+    dirs = []
+    spawn_positions = []
+
+    for _ in range(num_projectiles):
+        side = np.random.randint(4)
+        if side == 0:
+            pos = np.array([np.random.uniform(0, MAP_SIZE), MAP_SIZE])
+        elif side == 1:
+            pos = np.array([np.random.uniform(0, MAP_SIZE), 0])
+        elif side == 2:
+            pos = np.array([0, np.random.uniform(0, MAP_SIZE)])
+        else:
+            pos = np.array([MAP_SIZE, np.random.uniform(0, MAP_SIZE)])
+        spawn_positions.append(pos)
+
+    for pos in spawn_positions:
+        predicted_point = robot_pos + PREDICTION_FACTOR * (goal - robot_pos)
+        direction = predicted_point - pos
+        direction /= np.linalg.norm(direction)
+        angle_offset = np.random.uniform(-ANGLE_OFFSET_DEG, ANGLE_OFFSET_DEG)
+        direction = rotate_vector(direction, angle_offset)
+        direction /= np.linalg.norm(direction)
+        projectiles.append(pos)
+        dirs.append(direction)
+
+    return np.array(projectiles), np.array(dirs)
+
+
+# ----------------------------------------------------------------------------
+# One trial (same loop as the original, minus plotting)
+# ----------------------------------------------------------------------------
+def run_trial(job):
+    combo_name, weights, num_projectiles, projectile_speed, seed = job
+    np.random.seed(seed)  # same seed -> same environment for every weight combo
+
+    points = np.random.rand(NUM_POINTS, 2) * MAP_SIZE
+    while True:
+        start = np.random.rand(2) * MAP_SIZE
+        goal = np.random.rand(2) * MAP_SIZE
+        if np.linalg.norm(start - goal) > MAP_SIZE / 3:
+            break
+
+    robot_pos = start.copy()
+    projectiles, proj_dirs = spawn_guaranteed_projectiles(robot_pos, goal, num_projectiles)
+
+    steps = 0
+    path_trace = []
+    collision = False
+    current_edge = None
+    edge_target = None
+    outcome = None
+
+    try:
+        while np.linalg.norm(robot_pos - goal) > 2 and steps < MAX_STEPS:
+            steps += 1
+
+            projectiles += proj_dirs * projectile_speed
+            in_bounds = ((projectiles[:, 0] >= 0) & (projectiles[:, 0] <= MAP_SIZE) &
+                         (projectiles[:, 1] >= 0) & (projectiles[:, 1] <= MAP_SIZE))
+            projectiles = projectiles[in_bounds]
+            proj_dirs = proj_dirs[in_bounds]
+
+            for proj in projectiles:
+                if np.linalg.norm(robot_pos - proj) <= COLLISION_THRESHOLD:
+                    collision = True
+                    break
+            if collision:
+                break
+
+            if current_edge is None or np.allclose(robot_pos, edge_target, atol=0.5):
+                dynamic_points = np.vstack((points, projectiles)) if len(projectiles) > 0 else points
+                vor = Voronoi(dynamic_points)
+                graph = build_graph(vor)
+                robot_v = closest_vertex(robot_pos, vor.vertices)
+                goal_v = closest_vertex(goal, vor.vertices)
+                path_vertices = safe_greedy_path(graph, vor.vertices, robot_v, goal_v,
+                                                 projectiles, weights, projectile_speed)
+                if len(path_vertices) < 2:
+                    edge_target = goal
+                    current_edge = (robot_pos, goal)
+                else:
+                    v_start = vor.vertices[path_vertices[0]]
+                    v_next = vor.vertices[path_vertices[1]]
+                    robot_pos = project_point_to_segment(robot_pos, v_start, v_next)
+                    current_edge = (v_start, v_next)
+                    edge_target = v_next
+
+            direction = edge_target - robot_pos
+            dist = np.linalg.norm(direction)
+            if dist <= ROBOT_SPEED:
+                robot_pos = edge_target
+            else:
+                robot_pos += (direction / dist) * ROBOT_SPEED
+            robot_pos = np.clip(robot_pos, 0, MAP_SIZE)
+            path_trace.append(robot_pos.copy())
+    except Exception as exc:  # a crashed trial is kept and counted as a failure, never dropped
+        outcome = "error"
+
+    goal_reached = np.linalg.norm(robot_pos - goal) <= 2
+    success = goal_reached and not collision
+    if outcome is None:
+        outcome = "success" if success else ("collision" if collision else "timeout")
+
+    path_length = 0.0
+    for i in range(1, len(path_trace)):
+        path_length += np.linalg.norm(path_trace[i] - path_trace[i - 1])
+
+    return {
+        "Combo": combo_name,
+        "w_goal": weights[0], "w_risk": weights[1], "w_ttc": weights[2],
+        "w_smooth": weights[3], "w_backtrack": weights[4],
+        "Projectile Count": num_projectiles,
+        "Projectile Speed": projectile_speed,
+        "Seed": seed,
+        "Success": int(success),
+        "Outcome": outcome,
+        "Steps": steps,
+        "Path Length": round(path_length, 2),
+    }
+
+
+# ----------------------------------------------------------------------------
+# Batch + summary
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trials", type=int, default=50, help="seeds per combo per condition")
+    ap.add_argument("--seed-start", type=int, default=1)
+    ap.add_argument("--combos", default="all", help="comma-separated names or 'all'")
+    ap.add_argument("--out", default="sweep_results.csv")
+    ap.add_argument("--workers", type=int, default=0, help="0 = use all CPU cores")
+    args = ap.parse_args()
+
+    names = list(COMBOS) if args.combos == "all" else [c.strip() for c in args.combos.split(",")]
+    jobs = []
+    for name in names:
+        for n_proj in PROJECTILE_COUNTS:
+            for spd in PROJECTILE_SPEEDS:
+                for k in range(args.trials):
+                    jobs.append((name, COMBOS[name], n_proj, spd, args.seed_start + k))
+
+    print(f"{len(names)} combos x 9 conditions x {args.trials} seeds = {len(jobs)} trials")
+    t0 = time.time()
+    with Pool(args.workers or None) as pool:
+        rows = []
+        for i, row in enumerate(pool.imap_unordered(run_trial, jobs, chunksize=8), 1):
+            rows.append(row)
+            if i % 200 == 0:
+                print(f"  {i}/{len(jobs)} done ({time.time() - t0:.0f}s)")
+
+    rows.sort(key=lambda r: (r["Combo"], r["Projectile Count"], r["Projectile Speed"], r["Seed"]))
+    with open(args.out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"Saved {len(rows)} rows to {args.out} in {time.time() - t0:.0f}s\n")
+
+    # Summary: overall success rate per combo, then per condition
+    by_combo = defaultdict(list)
+    by_cond = defaultdict(list)
+    path_ok = defaultdict(list)
+    for r in rows:
+        by_combo[r["Combo"]].append(r["Success"])
+        by_cond[(r["Combo"], r["Projectile Count"], r["Projectile Speed"])].append(r["Success"])
+        if r["Success"]:
+            path_ok[r["Combo"]].append(r["Path Length"])
+
+    print(f"{'Combo':<16}{'Success':>9}{'n':>7}{'Mean path (successes)':>25}")
+    for name in sorted(by_combo, key=lambda n: -np.mean(by_combo[n])):
+        mp = np.mean(path_ok[name]) if path_ok[name] else float("nan")
+        print(f"{name:<16}{np.mean(by_combo[name]):>9.3f}{len(by_combo[name]):>7}{mp:>25.1f}")
+
+    print("\nSuccess rate by condition (rows = combo, columns = count/speed)")
+    header = "".join(f"{c}/{s:>1}".rjust(8) for c in PROJECTILE_COUNTS for s in PROJECTILE_SPEEDS)
+    print(f"{'Combo':<16}{header}")
+    for name in names:
+        vals = "".join(f"{np.mean(by_cond[(name, c, s)]):8.2f}"
+                       for c in PROJECTILE_COUNTS for s in PROJECTILE_SPEEDS)
+        print(f"{name:<16}{vals}")
+
+
+if __name__ == "__main__":
+    main()
